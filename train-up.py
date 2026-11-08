@@ -9,12 +9,12 @@ from sklearn import metrics
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.utils.tensorboard import SummaryWriter
 
-from model.mapping import Mapping
+from model.mapping import FADM, Mapping
 from model.encoder import Encoder
+from config.ablation import USE_DG_CPF, USE_FADM, FADM_NUM_MODES
 from utils.dataloader import get_HBKC_data_loader, Task, get_target_dataset
 from utils import utils, loss_function
 
@@ -145,6 +145,8 @@ experimentSetting = '{}way_{}shot_{}'.format(TAR_CLASS_NUM, TAR_LSAMPLE_NUM_PER_
 utils.set_logging_config(os.path.join(log_dir, experimentSetting), nDataSet)
 logger = logging.getLogger('main')
 logger.info('seeds_list:{}'.format(seeds))
+logger.info('DG-CPF=%s, FADM=%s, FADM num_modes=%s',
+            USE_DG_CPF, USE_FADM, FADM_NUM_MODES if USE_FADM else None)
 
 for iDataSet in range(nDataSet):
     logger.info('emb_size:{}'.format(emb_size))
@@ -165,9 +167,13 @@ for iDataSet in range(nDataSet):
     num_supports, num_samples, query_edge_mask, evaluation_mask = utils.preprocess(TAR_CLASS_NUM, SHOT_NUM_PER_CLASS,
                                                                                    QUERY_NUM_PER_CLASS, batch_task, GPU)
 
-    mapping_src = Mapping(SRC_INPUT_DIMENSION, N_DIMENSION).to(GPU)
-    mapping_tar = Mapping(TAR_INPUT_DIMENSION, N_DIMENSION).to(GPU)
-    encoder = Encoder(n_dimension=N_DIMENSION, patch_size=patch_size, emb_size=emb_size, dropout=0.3).to(GPU)
+    if USE_FADM:
+        mapping_src = FADM(SRC_INPUT_DIMENSION, N_DIMENSION, FADM_NUM_MODES).to(GPU)
+        mapping_tar = FADM(TAR_INPUT_DIMENSION, N_DIMENSION, FADM_NUM_MODES).to(GPU)
+    else:
+        mapping_src = Mapping(SRC_INPUT_DIMENSION, N_DIMENSION).to(GPU)
+        mapping_tar = Mapping(TAR_INPUT_DIMENSION, N_DIMENSION).to(GPU)
+    encoder = Encoder(n_dimension=N_DIMENSION, patch_size=patch_size, emb_size=emb_size, dropout=0.3, use_dg_cpf=USE_DG_CPF).to(GPU)
 
     mapping_src_optim = torch.optim.SGD(mapping_src.parameters(), lr=LEARNING_RATE, momentum=0.9,
                                         weight_decay=WEIGHT_DECAY)
@@ -177,6 +183,10 @@ for iDataSet in range(nDataSet):
 
     mapping_src.apply(utils.weights_init)
     mapping_tar.apply(utils.weights_init)
+    if USE_FADM:
+        # The global initializer also visits the final frequency convolutions.
+        mapping_src.zero_frequency_projection()
+        mapping_tar.zero_frequency_projection()
     encoder.apply(utils.weights_init)
 
     mapping_src.to(GPU)
@@ -243,33 +253,15 @@ for iDataSet in range(nDataSet):
             P_ss_src = support_features_src
             P_ss_tar = support_features_tar
 
-        # ==========================================================
-        # 创新一：DG-CPF 双粒度跨域原型融合 (免对比学习方案)
-        # 1. 计算目标域空谱(粗)与源域空谱(细)的余弦相似度矩阵
-        sim_matrix = F.cosine_similarity(P_ss_tar.unsqueeze(1), P_ss_src.unsqueeze(0), dim=-1)
+        target_prototypes = P_ss_tar
+        if USE_DG_CPF:
+            current_tau = encoder.tau.clamp_min(0.05)
+            target_prototypes = encoder.fuse_prototypes(P_ss_tar, P_ss_src, current_tau)
 
-        # 2. 温度缩放的 Softmax 获得自适应权重
-        current_tau = torch.clamp(encoder.tau, min=0.05)
-        attn_weights = F.softmax(sim_matrix / current_tau, dim=1)
-
-        # 3. 加权生成细粒度源域先验，并经过 Linear(d->d) 严格对齐流形
-        P_prior_tar = torch.matmul(attn_weights, P_ss_src)
-        P_prior_tar_proj = F.normalize(encoder.src_to_tar_proj(P_prior_tar), p=2, dim=1)
-        P_ss_tar_norm = F.normalize(P_ss_tar, p=2, dim=1)
-
-        # 4. 门控网络自适应融合 (截取源域结构平滑目标域偏移)
-        gate_input = torch.cat([P_ss_tar_norm, P_prior_tar_proj], dim=-1)
-        beta_gate = encoder.fusion_gate(gate_input)
-
-        # 5. 得到增强版目标域原型
-        P_ss_tar_enhanced = beta_gate * P_ss_tar + (1.0 - beta_gate) * P_prior_tar_proj
-        # ==========================================================
-
-        # 决策层：源域用原始原型，目标域用修正后的增强原型
         logits_src = utils.euclidean_metric(query_features_src, P_ss_src)
         f_loss_src = crossEntropy(logits_src, query_label_src.long().to(GPU))
 
-        logits_tar = utils.euclidean_metric(query_features_tar, P_ss_tar_enhanced)
+        logits_tar = utils.euclidean_metric(query_features_tar, target_prototypes)
         f_loss_tar = crossEntropy(logits_tar, query_label_tar.long().to(GPU))
 
         f_loss = f_loss_src + f_loss_tar
@@ -342,32 +334,23 @@ for iDataSet in range(nDataSet):
                 train_features, _ = encoder(mapping_tar(Variable(train_datas).to(GPU)),
                                             semantic_feature=semantic_support.to(GPU), s_or_q="support")
 
-                # --- 复用 DG-CPF 逻辑生成测试期的增强原型 ---
-                # 注意：测试期支持集每类有 TAR_LSAMPLE_NUM_PER_CLASS 个样本，故按该值聚合
-                if TAR_LSAMPLE_NUM_PER_CLASS > 1:
-                    P_ss_tar_test = train_features.reshape(TAR_CLASS_NUM, TAR_LSAMPLE_NUM_PER_CLASS, -1).mean(dim=1)
-                else:
-                    P_ss_tar_test = train_features
+                # Build one target prototype per class from the evaluation support set.
+                target_prototypes_test = train_features.reshape(
+                    TAR_CLASS_NUM, TAR_LSAMPLE_NUM_PER_CLASS, -1
+                ).mean(dim=1)
+                if USE_DG_CPF:
+                    # Preserve the original evaluation source priors from this episode.
+                    target_prototypes_test = encoder.fuse_prototypes(
+                        target_prototypes_test, P_ss_src, current_tau
+                    )
 
-                # 复用当前 episode 训练循环中已提取的源域先验 P_ss_src 与温度 current_tau
-                sim_matrix_test = F.cosine_similarity(P_ss_tar_test.unsqueeze(1), P_ss_src.unsqueeze(0), dim=-1)
-                attn_weights_test = F.softmax(sim_matrix_test / current_tau, dim=1)
-                P_prior_tar_test = torch.matmul(attn_weights_test, P_ss_src)
-                P_prior_tar_proj_test = F.normalize(encoder.src_to_tar_proj(P_prior_tar_test), p=2, dim=1)
-                P_ss_tar_norm_test = F.normalize(P_ss_tar_test, p=2, dim=1)
-                gate_input_test = torch.cat([P_ss_tar_norm_test, P_prior_tar_proj_test], dim=-1)
-                beta_gate_test = encoder.fusion_gate(gate_input_test)
-                P_ss_tar_enhanced_test = beta_gate_test * P_ss_tar_test + (1.0 - beta_gate_test) * P_prior_tar_proj_test
-                # -----------------------------------------------------
-
-                # 移除 KNN，直接使用距离度量进行推理
                 for test_datas, test_labels in test_loader:
                     batch_size = test_labels.shape[0]
 
                     test_features = encoder(mapping_tar((Variable(test_datas).to(GPU))))
 
                     # 距离度量代替 KNN
-                    logits_test = utils.euclidean_metric(test_features, P_ss_tar_enhanced_test)
+                    logits_test = utils.euclidean_metric(test_features, target_prototypes_test)
                     predict_labels = torch.argmax(logits_test, dim=1).cpu().numpy()
 
                     test_labels = test_labels.numpy()
@@ -476,6 +459,8 @@ for i in range(best_G.shape[0]):
             hsi_pic[i, j, :] = [0.5, 0.75, 1]
 
 halfwidth = patch_size // 2
+os.makedirs("classificationMap", exist_ok=True)
 utils.classification_map(hsi_pic[halfwidth:-halfwidth, halfwidth:-halfwidth, :],
                          best_G[halfwidth:-halfwidth, halfwidth:-halfwidth], 24,
                          "classificationMap/UP_{}shot.png".format(TAR_LSAMPLE_NUM_PER_CLASS))
+

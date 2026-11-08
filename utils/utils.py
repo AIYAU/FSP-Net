@@ -4,7 +4,6 @@ import scipy.io as sio
 from sklearn import preprocessing
 import matplotlib.pyplot as plt
 import os
-from pathlib import Path
 import logging
 import datetime
 
@@ -117,8 +116,8 @@ def load_data(image_file, label_file):
     image_data = sio.loadmat(image_file)
     label_data = sio.loadmat(label_file)
 
-    data_key = Path(image_file).stem
-    label_key = Path(label_file).stem
+    data_key = image_file.split('/')[-1].split('.')[0]
+    label_key = label_file.split('/')[-1].split('.')[0]
     data_all = image_data[data_key]
     GroundTruth = label_data[label_key]
 
@@ -136,9 +135,9 @@ def load_data_houston(image_file, label_file,label_file1):
     label_data = sio.loadmat(label_file)
     label_data1 = sio.loadmat(label_file1)
 
-    data_key = Path(image_file).stem
-    label_key = Path(label_file).stem
-    label_key1 = Path(label_file1).stem
+    data_key = image_file.split('/')[-1].split('.')[0]
+    label_key = label_file.split('/')[-1].split('.')[0]
+    label_key1 = label_file1.split('/')[-1].split('.')[0]
 
     data_all = image_data[data_key]  # dic-> narray , KSC:ndarray(512,217,204)
     GroundTruth_train = label_data[label_key]
@@ -155,7 +154,6 @@ def load_data_houston(image_file, label_file,label_file1):
     return Data_Band_Scaler, GroundTruth_train, GroundTruth_test  # image:(512,217,3),label:(512,217)
 
 def classification_map(map, groundTruth, dpi, savePath):
-    Path(savePath).parent.mkdir(parents=True, exist_ok=True)
     fig = plt.figure(frameon=False)
     fig.set_size_inches(groundTruth.shape[1]*2.0/dpi, groundTruth.shape[0]*2.0/dpi)
     ax = plt.Axes(fig, [0., 0., 1., 1.])

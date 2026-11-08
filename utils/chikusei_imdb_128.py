@@ -1,6 +1,5 @@
 import numpy as np
 import pickle
-from pathlib import Path
 import hdf5storage
 from  sklearn import preprocessing
 import scipy.io as sio
@@ -62,8 +61,8 @@ def load_data_HDF(image_file, label_file):
 def load_data(image_file, label_file):
     image_data = sio.loadmat(image_file)
     label_data = sio.loadmat(label_file)
-    data_key = Path(image_file).stem
-    label_key = Path(label_file).stem
+    data_key = image_file.split('/')[-1].split('.')[0]
+    label_key = label_file.split('/')[-1].split('.')[0]
     data_all = image_data[data_key]
     label = label_data[label_key]
     gt = label.reshape(np.prod(label.shape[:2]), )
@@ -126,13 +125,11 @@ def getDataAndLabels(trainfn1, trainfn2, patch_length):
 
     return imdb
 
-if __name__ == '__main__':
-    data_dir = Path(__file__).resolve().parents[1] / 'datasets'
-    train_data_file = data_dir / 'Chikusei_raw_mat' / 'HyperspecVNIR_Chikusei_20140729.mat'
-    train_label_file = data_dir / 'Chikusei_raw_mat' / 'HyperspecVNIR_Chikusei_20140729_Ground_Truth.mat'
+train_data_file = '../datasets/Chikusei_raw_mat/HyperspecVNIR_Chikusei_20140729.mat'
+train_label_file = '../datasets/Chikusei_raw_mat/HyperspecVNIR_Chikusei_20140729_Ground_Truth.mat'
 
-    imdb = getDataAndLabels(str(train_data_file), str(train_label_file), patch_length=3) # 7*7
-    with (data_dir / 'Chikusei_imdb_128_7_7.pickle').open('wb') as handle:
-        pickle.dump(imdb, handle, protocol=4)
+imdb = getDataAndLabels(train_data_file, train_label_file, patch_length=3) # 7*7
+with open('../datasets/Chikusei_imdb_128_7_7_test.pickle', 'wb') as handle:
+    pickle.dump(imdb, handle, protocol=4)
 
-    print('Images preprocessed')
+print('Images preprocessed')

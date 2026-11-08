@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class SpectralEncoder(nn.Module):
     def __init__(self, input_channels, patch_size, feature_dim):
@@ -150,7 +151,7 @@ class AttentionWeight(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, n_dimension, patch_size, emb_size, dropout=0.5):
+    def __init__(self, n_dimension, patch_size, emb_size, dropout=0.5, use_dg_cpf=True):
         super(Encoder, self).__init__()
         self.n_dimension = n_dimension
         self.patch_size = patch_size
@@ -161,23 +162,33 @@ class Encoder(nn.Module):
         self.spatial_encoder = SpatialEncoder(input_channels=self.n_dimension, patch_size=self.patch_size, feature_dim=self.emb_size)
         self.word_emb_transformers = WordEmbTransformers(feature_dim=self.emb_size, dropout=self.dropout)
 
-        # ====== 为创新一 (DG-CPF) 新增的结构 ======
-        # 可学习的温度系数
-        self.tau = nn.Parameter(torch.tensor(0.5))
-        # 跨域投影层：将源域先验映射到目标域流形
-        self.src_to_tar_proj = nn.Sequential(
-            nn.Linear(self.emb_size, self.emb_size),
-            nn.LayerNorm(self.emb_size),
-            nn.ReLU()
+        if use_dg_cpf:
+            # 可学习的温度系数
+            self.tau = nn.Parameter(torch.tensor(0.5))
+            # 跨域投影层：将源域先验映射到目标域流形
+            self.src_to_tar_proj = nn.Sequential(
+                nn.Linear(self.emb_size, self.emb_size),
+                nn.LayerNorm(self.emb_size),
+                nn.ReLU()
+            )
+            # 双粒度融合门控网络
+            self.fusion_gate = nn.Sequential(
+                nn.Linear(self.emb_size * 2, self.emb_size // 2),
+                nn.ReLU(),
+                nn.Linear(self.emb_size // 2, self.emb_size),
+                nn.Sigmoid()
+            )
+
+    def fuse_prototypes(self, target_prototypes, source_prototypes, temperature):
+        similarity = F.cosine_similarity(
+            target_prototypes.unsqueeze(1), source_prototypes.unsqueeze(0), dim=-1
         )
-        # 双粒度融合门控网络
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(self.emb_size * 2, self.emb_size // 2),
-            nn.ReLU(),
-            nn.Linear(self.emb_size // 2, self.emb_size),
-            nn.Sigmoid()
-        )
-        # ========================================
+        weights = F.softmax(similarity / temperature, dim=1)
+        source_prior = weights @ source_prototypes
+        source_prior = F.normalize(self.src_to_tar_proj(source_prior), p=2, dim=1)
+        target_normalized = F.normalize(target_prototypes, p=2, dim=1)
+        gate = self.fusion_gate(torch.cat([target_normalized, source_prior], dim=-1))
+        return gate * target_prototypes + (1.0 - gate) * source_prior
 
     def forward(self, x, semantic_feature="", s_or_q="query"):
         spatial_feature = self.spatial_encoder(x)
